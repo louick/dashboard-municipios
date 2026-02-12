@@ -1,6 +1,7 @@
 {
+  "$schema": "https://schema.railpack.com",
   "deploy": {
-    "startCommand": "gunicorn -b 0.0.0.0:$PORT -w 2 --threads 4 --timeout 120 app:server"
+    "startCommand": "python -m gunicorn app:server --bind 0.0.0.0:${PORT:-8050} --workers 1 --threads 4 --timeout 120"
   },
   "packages": {
     "python": "3.12.3"

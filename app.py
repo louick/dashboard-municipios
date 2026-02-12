@@ -24,6 +24,9 @@ MUNICIPAL_IBGE_MAX = 1600000  # exclusivo
 
 YEAR_OFFSET = 2  # <-- ANO EXIBIDO = ANO REAL + 2
 
+# Financeiro: exibir em milhões (para KPIs e gráficos financeiros)
+MONEY_SCALE = 1_000_000  # 1 milhão
+
 # Branding (inspirado no topo Gov PA / Fapespa)
 BRAND_BLUE = "#0B4D8C"
 BRAND_BLUE_DARK = "#083A69"
@@ -39,7 +42,7 @@ def display_year(ano_real: int) -> int:
     return int(ano_real) + YEAR_OFFSET
 
 
-def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = "Ano (exibido)"):
+def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = ""):
     """
     Elimina frações de ano e mostra ANO EXIBIDO (ano real + YEAR_OFFSET).
     """
@@ -64,6 +67,7 @@ def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = "Ano (exibido
         template="plotly_white",
         paper_bgcolor=BRAND_CARD,
         plot_bgcolor=BRAND_CARD,
+        separators=".,",  # pt-BR: milhar "." e decimal ","
         font=dict(
             family="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial",
             color=BRAND_TEXT,
@@ -75,10 +79,20 @@ def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = "Ano (exibido
 # =========================
 # Helpers
 # =========================
-def format_ptbr_number(x: float | int) -> str:
+def format_ptbr_number(x: float | int, decimals: int = 2) -> str:
     # 1234567.89 -> "1.234.567,89"
-    s = f"{float(x):,.2f}"
+    s = f"{float(x):,.{decimals}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_number_mi(v: float | int | None, decimals: int = 1) -> str:
+    """
+    Formata número já em milhões (sem prefixo "R$" — fica mais limpo pros cards).
+    Ex: 541.7 -> "541,7"
+    """
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    return format_ptbr_number(float(v), decimals=decimals)
 
 
 def format_value(indicador: str, v) -> str:
@@ -148,8 +162,10 @@ def wide_to_kv(df: pd.DataFrame, municipio: str, nome_col: str) -> pd.DataFrame:
         return pd.DataFrame([{"Indicador": "—", "Valor": "Município não encontrado nessa aba"}])
 
     row = row.iloc[0].to_dict()
+
+    # Remover chaves técnicas / metadados (inclui IBGE para não aparecer como “Indicador”)
     for k in list(row.keys()):
-        if k in ["Código IBGE", "R. Integ.", "Indicador", "Nome_Município"]:
+        if k in ["Código IBGE", "IBGE", "R. Integ.", "Indicador", "Nome_Município"]:
             row.pop(k, None)
 
     items = [{"Indicador": str(k), "Valor": format_value(str(k), v)} for k, v in row.items()]
@@ -237,7 +253,6 @@ def make_kv_table_component(table_id: str, title: str) -> html.Div:
                 className="block-head",
                 children=[
                     html.Div(title, className="block-title"),
-                    html.Div("Somente municípios • RI removido", className="block-subtitle"),
                 ],
             ),
             dash_table.DataTable(
@@ -289,34 +304,49 @@ def ranking_fig(df_long: pd.DataFrame, value_col: str, ano: int, municipio: str,
     top["_sel"] = np.where(top["Municipio"] == municipio, "Selecionado", "Outros")
     top = top.sort_values(value_col, ascending=True)
 
+    # valores em milhões
+    top["_value_mi"] = pd.to_numeric(top[value_col], errors="coerce") / MONEY_SCALE
+
     fig = px.bar(
         top,
-        x=value_col,
+        x="_value_mi",
         y="Municipio",
         orientation="h",
         color="_sel",
         color_discrete_map={"Selecionado": BRAND_RED, "Outros": BRAND_BLUE},
-        title=f"Ranking (Top {top_n}) — Ano exibido {display_year(ano)}",
-        hover_data={"Municipio": True, value_col: ":,.2f"},
+        title="",
     )
+
+    fig.update_traces(hovertemplate="%{y}<br>R$ %{x:,.1f}<extra></extra>")
+
     fig.update_layout(
-        margin=dict(l=10, r=10, t=60, b=10),
+        margin=dict(l=10, r=10, t=40, b=10),
         height=520,
         showlegend=False,
         template="plotly_white",
         paper_bgcolor=BRAND_CARD,
         plot_bgcolor=BRAND_CARD,
+        separators=".,",
         font=dict(
             family="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial",
             color=BRAND_TEXT,
         ),
     )
-    fig.update_xaxes(showgrid=True, gridcolor=BRAND_BORDER, zeroline=False, title="Valor")
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor=BRAND_BORDER,
+        zeroline=False,
+        title="R$ milhões",
+        tickformat=",.0f",
+    )
     fig.update_yaxes(showgrid=False, title="")
     return fig
 
 
-def series_fig(df_long: pd.DataFrame, value_col: str, municipio: str, title: str):
+def series_fig_money_mi(df_long: pd.DataFrame, value_col: str, municipio: str, title: str):
+    """
+    Série (financeiro) em R$ milhões.
+    """
     if municipio is None:
         fig = px.line(title="—")
         fig.update_layout(height=360)
@@ -324,12 +354,23 @@ def series_fig(df_long: pd.DataFrame, value_col: str, municipio: str, title: str
 
     d = df_long[df_long["Municipio"] == municipio].copy()
     d = d.sort_values("Ano")
+    d["_value_mi"] = pd.to_numeric(d[value_col], errors="coerce") / MONEY_SCALE
+    d["_ano_exib"] = d["Ano"].apply(display_year).astype(int)
 
-    fig = px.line(d, x="Ano", y=value_col, markers=True, title=title)
-    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10), height=360)
-    fig.update_traces(line=dict(width=3, color=BRAND_BLUE), marker=dict(size=8, color=BRAND_BLUE))
-    apply_year_ticks(fig, ANOS)
-    fig.update_yaxes(title=value_col)
+    fig = px.line(d, x="Ano", y="_value_mi", markers=True, title=title)
+    fig.update_layout(margin=dict(l=10, r=10, t=70, b=10), height=360)
+
+    fig.update_traces(
+        name=value_col,
+        line=dict(width=3, color=BRAND_BLUE),
+        marker=dict(size=8, color=BRAND_BLUE),
+        customdata=d["_ano_exib"],
+        hovertemplate=f"{value_col}<br>Ano: %{{customdata}}<br>R$ %{{y:,.1f}}<extra></extra>",
+    )
+
+    apply_year_ticks(fig, ANOS, axis_title="")
+    fig.update_yaxes(title="R$ milhões", tickformat=",.0f")
+    fig.update_layout(legend_title_text="")
     return fig
 
 
@@ -480,6 +521,7 @@ html, body {{ background: var(--bg); }}
   font-size: 20px;
   font-weight: 900;
   margin-top: 4px;
+  white-space: nowrap;
 }}
 
 .block-card {{
@@ -569,13 +611,7 @@ topbar = html.Div(
                         ),
                     ],
                 ),
-                html.Div(
-                    className="pill",
-                    children=[
-                        html.I(className="bi bi-calendar2-week"),
-                        html.Span(f"Ano exibido = Ano real + {YEAR_OFFSET}"),
-                    ],
-                ),
+                html.Div(),  # (vazio) — removido texto bobo do ano
             ],
         ),
     ],
@@ -587,7 +623,7 @@ sidebar = dbc.Card(
         dbc.CardBody(
             [
                 html.Div(className="side-title", children=["Controle"]),
-                html.Div(className="side-muted", children=["Selecione o município e os anos das abas financeiras."]),
+                html.Div(className="side-muted", children=["Selecione o município e o ano das contas públicas."]),
                 html.Hr(),
                 html.Div(
                     className="side-section",
@@ -604,20 +640,6 @@ sidebar = dbc.Card(
                         html.Div(id="meta_municipio", style={"marginTop": "10px"}),
                     ],
                 ),
-                html.Div(
-                    className="side-section",
-                    children=[
-                        html.Div(
-                            className="side-label",
-                            children=[html.I(className="bi bi-file-earmark-spreadsheet-fill me-2"), "Planilha carregada"],
-                        ),
-                        html.Div(str(XLSX_PATH), style={"fontSize": "12px", "opacity": 0.75, "wordBreak": "break-all"}),
-                        html.Div(
-                            "Obs.: 'Infraest. 02' é por Região de Integração → ignorada.",
-                            style={"marginTop": "10px", "fontSize": "12px", "opacity": 0.75},
-                        ),
-                    ],
-                ),
             ]
         )
     ],
@@ -632,19 +654,21 @@ def year_dropdown(id_, value):
     )
 
 def wrap_graph(graph_id: str, height: int | None = None):
-    # Loading + card (fica “vivo” enquanto carrega)
     g = dcc.Graph(id=graph_id, style={"height": f"{height}px"} if height else {})
     return dbc.Spinner(html.Div(g), color="primary", delay_show=150)
 
+# =========================
+# TABS (AGRUPADO)
+# =========================
 tabs = dcc.Tabs(
     id="tabs",
-    value="resumo",
+    value="contas_publicas",
     className="custom-tabs",
     parent_className="custom-tabs",
     children=[
         dcc.Tab(
-            label="Resumo",
-            value="resumo",
+            label="Contas Públicas",
+            value="contas_publicas",
             className="custom-tab",
             selected_className="custom-tab custom-tab--selected",
             children=[
@@ -653,12 +677,8 @@ tabs = dcc.Tabs(
                     [
                         dbc.Col(
                             [
-                                dbc.Label("Ano (exibido)", className="side-label"),
+                                dbc.Label("Ano", className="side-label"),
                                 year_dropdown("ano_resumo", DEFAULT_ANO),
-                                html.Div(
-                                    id="ano_resumo_hint",
-                                    style={"marginTop": "6px", "fontSize": "12px", "opacity": 0.75},
-                                ),
                             ],
                             md=4,
                         ),
@@ -666,28 +686,49 @@ tabs = dcc.Tabs(
                 ),
                 html.Br(),
 
-                # KPIs
                 html.Div(
                     className="kpi-grid",
                     children=[
-                        dbc.Card(dbc.CardBody([html.Div("Receita", className="kpi-label"), html.Div(id="card_receita", className="kpi-value")]), className="kpi-card"),
-                        dbc.Card(dbc.CardBody([html.Div("Despesa", className="kpi-label"), html.Div(id="card_despesa", className="kpi-value")]), className="kpi-card"),
-                        dbc.Card(dbc.CardBody([html.Div("FPM", className="kpi-label"), html.Div(id="card_fpm", className="kpi-value")]), className="kpi-card"),
-                        dbc.Card(dbc.CardBody([html.Div("Saldo (Receita - Despesa)", className="kpi-label"), html.Div(id="card_saldo", className="kpi-value")]), className="kpi-card"),
+                        dbc.Card(
+                            dbc.CardBody([
+                                html.Div("Receita (R$ mi)", className="kpi-label"),
+                                html.Div(id="card_receita", className="kpi-value"),
+                            ]),
+                            className="kpi-card",
+                        ),
+                        dbc.Card(
+                            dbc.CardBody([
+                                html.Div("Despesa (R$ mi)", className="kpi-label"),
+                                html.Div(id="card_despesa", className="kpi-value"),
+                            ]),
+                            className="kpi-card",
+                        ),
+                        dbc.Card(
+                            dbc.CardBody([
+                                html.Div("FPM (R$ mi)", className="kpi-label"),
+                                html.Div(id="card_fpm", className="kpi-value"),
+                            ]),
+                            className="kpi-card",
+                        ),
+                        dbc.Card(
+                            dbc.CardBody([
+                                html.Div("Saldo (R$ mi)", className="kpi-label"),
+                                html.Div(id="card_saldo", className="kpi-value"),
+                            ]),
+                            className="kpi-card",
+                        ),
                     ],
                 ),
                 html.Br(),
 
-                # Série Receita vs Despesa
                 html.Div(className="block-card", children=[wrap_graph("fig_receita_vs_despesa")]),
                 html.Br(),
 
-                # ✅ CONSOLIDADO: Rankings (no mesmo Ano do Resumo)
                 html.Div(
                     className="block-card",
                     children=[
                         html.Div(className="block-head", children=[
-                            html.Div("Rankings do ano selecionado", className="block-title"),
+                            html.Div("Ranking do ano selecionado — Top 20", className="block-title"),
                             html.Div("Receita • Despesa • FPM", className="block-subtitle"),
                         ]),
                         dbc.Row(
@@ -702,13 +743,12 @@ tabs = dcc.Tabs(
                 ),
                 html.Br(),
 
-                # ✅ CONSOLIDADO: Séries históricas (todas)
                 html.Div(
                     className="block-card",
                     children=[
                         html.Div(className="block-head", children=[
                             html.Div("Séries históricas", className="block-title"),
-                            html.Div("Ano exibido = Ano real + 2", className="block-subtitle"),
+                            html.Div("Valores em R$ milhões", className="block-subtitle"),
                         ]),
                         dbc.Row(
                             [
@@ -722,80 +762,65 @@ tabs = dcc.Tabs(
                 ),
                 html.Br(),
 
-                # Mantive também o FPM “grande” (se quiser remover, é só apagar esse bloco)
                 html.Div(className="block-card", children=[wrap_graph("fig_fpm_series")]),
             ],
         ),
 
         dcc.Tab(
-            label="Receita",
-            value="receita",
+            label="Síntese Municipal",
+            value="sintese_municipal",
             className="custom-tab",
             selected_className="custom-tab custom-tab--selected",
             children=[
                 html.Br(),
-                dbc.Row(
-                    [
-                        dbc.Col([dbc.Label("Ano (exibido)", className="side-label"), year_dropdown("ano_receita", DEFAULT_ANO)], md=4),
-                    ]
-                ),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_receita_ranking")]),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_receita_series")]),
+                make_kv_table_component("table_geral", "Geral (por município)"),
             ],
         ),
 
         dcc.Tab(
-            label="Despesa",
-            value="despesa",
+            label="Síntese Econômica",
+            value="sintese_economica",
             className="custom-tab",
             selected_className="custom-tab custom-tab--selected",
             children=[
                 html.Br(),
                 dbc.Row(
                     [
-                        dbc.Col([dbc.Label("Ano (exibido)", className="side-label"), year_dropdown("ano_despesa", DEFAULT_ANO)], md=4),
-                    ]
+                        dbc.Col(make_kv_table_component("table_eco1", "Economia 01 (por município)"), md=6),
+                        dbc.Col(make_kv_table_component("table_eco2", "Economia 02 (por município)"), md=6),
+                    ],
+                    className="g-2",
                 ),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_despesa_ranking")]),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_despesa_series")]),
             ],
         ),
 
         dcc.Tab(
-            label="FPM",
-            value="fpm",
+            label="Infraestrutura",
+            value="infraestrutura",
+            className="custom-tab",
+            selected_className="custom-tab custom-tab--selected",
+            children=[
+                html.Br(),
+                make_kv_table_component("table_inf1", "Infraest. 01 (por município)"),
+            ],
+        ),
+
+        dcc.Tab(
+            label="Turismo",
+            value="turismo",
             className="custom-tab",
             selected_className="custom-tab custom-tab--selected",
             children=[
                 html.Br(),
                 dbc.Row(
                     [
-                        dbc.Col([dbc.Label("Ano (exibido)", className="side-label"), year_dropdown("ano_fpm", DEFAULT_ANO)], md=4),
-                    ]
+                        dbc.Col(make_kv_table_component("table_tur1", "Turismo — Empreendimentos (por município)"), md=6),
+                        dbc.Col(make_kv_table_component("table_tur2", "Turismo — Empregos (por município)"), md=6),
+                    ],
+                    className="g-2",
                 ),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_fpm_ranking")]),
-                html.Br(),
-                html.Div(className="block-card", children=[wrap_graph("fig_fpm_series_tab")]),
             ],
         ),
-
-        dcc.Tab(label="Geral", value="geral", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_geral", "Geral (por município)")]),
-        dcc.Tab(label="Economia 01", value="eco1", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_eco1", "Economia 01 (por município)")]),
-        dcc.Tab(label="Economia 02", value="eco2", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_eco2", "Economia 02 (por município)")]),
-        dcc.Tab(label="Infraest. 01", value="inf1", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_inf1", "Infraest. 01 (por município)")]),
-        dcc.Tab(label="Turismo - Empreend.", value="tur1", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_tur1", "Turismo - Empreendimentos (por município)")]),
-        dcc.Tab(label="Turismo - Empregos", value="tur2", className="custom-tab", selected_className="custom-tab custom-tab--selected",
-                children=[html.Br(), make_kv_table_component("table_tur2", "Turismo - Empregos (por município)")]),
     ],
 )
 
@@ -835,13 +860,6 @@ def update_meta(municipio: str):
     return html.Div(className="pill", children=[html.I(className="bi bi-hash"), html.Span(f"IBGE: {ibge}")])
 
 
-@app.callback(Output("ano_resumo_hint", "children"), Input("ano_resumo", "value"))
-def hint_ano(ano_real):
-    if not ano_real:
-        return ""
-    return f"Ano real: {int(ano_real)} • Ano exibido: {display_year(int(ano_real))}"
-
-
 @app.callback(
     Output("card_receita", "children"),
     Output("card_despesa", "children"),
@@ -858,20 +876,24 @@ def hint_ano(ano_real):
     Input("municipio", "value"),
     Input("ano_resumo", "value"),
 )
-def update_resumo(municipio: str, ano: int):
-    # KPIs
+def update_contas_publicas(municipio: str, ano: int):
     r = get_value(receita_long, "Receita", municipio, ano)
     d = get_value(despesa_long, "Despesa", municipio, ano)
     f = get_value(fpm_long, "FPM", municipio, ano)
 
-    r_txt = "—" if r is None else f"R$ {format_ptbr_number(r)}"
-    d_txt = "—" if d is None else f"R$ {format_ptbr_number(d)}"
-    f_txt = "—" if f is None else f"R$ {format_ptbr_number(f)}"
+    r_mi = None if r is None else (r / MONEY_SCALE)
+    d_mi = None if d is None else (d / MONEY_SCALE)
+    f_mi = None if f is None else (f / MONEY_SCALE)
+
+    r_txt = format_number_mi(r_mi, decimals=1)
+    d_txt = format_number_mi(d_mi, decimals=1)
+    f_txt = format_number_mi(f_mi, decimals=1)
 
     saldo = None if (r is None or d is None) else (r - d)
-    s_txt = "—" if saldo is None else f"R$ {format_ptbr_number(saldo)}"
+    saldo_mi = None if saldo is None else (saldo / MONEY_SCALE)
+    s_txt = format_number_mi(saldo_mi, decimals=1)
 
-    # Receita vs Despesa (série)
+    # Série Receita vs Despesa (em milhões)
     dd = pd.merge(
         receita_long[receita_long["Municipio"] == municipio][["Ano", "Receita"]],
         despesa_long[despesa_long["Municipio"] == municipio][["Ano", "Despesa"]],
@@ -879,85 +901,68 @@ def update_resumo(municipio: str, ano: int):
         how="outer",
     ).sort_values("Ano")
 
-    fig_rd = px.line(dd, x="Ano", y=["Receita", "Despesa"], markers=True, title="Série histórica — Receita vs Despesa")
-    fig_rd.update_layout(margin=dict(l=10, r=10, t=60, b=10), height=420)
+    dd["Receita_mi"] = pd.to_numeric(dd["Receita"], errors="coerce") / MONEY_SCALE
+    dd["Despesa_mi"] = pd.to_numeric(dd["Despesa"], errors="coerce") / MONEY_SCALE
+    dd["_ano_exib"] = dd["Ano"].apply(display_year).astype(int)
 
-    if len(fig_rd.data) >= 1:
-        fig_rd.data[0].line.color = BRAND_BLUE
-        fig_rd.data[0].marker.color = BRAND_BLUE
-        fig_rd.data[0].line.width = 3
-        fig_rd.data[0].marker.size = 8
-    if len(fig_rd.data) >= 2:
-        fig_rd.data[1].line.color = BRAND_RED
-        fig_rd.data[1].marker.color = BRAND_RED
-        fig_rd.data[1].line.width = 3
-        fig_rd.data[1].marker.size = 8
+    fig_rd = px.line(
+        dd,
+        x="Ano",
+        y=["Receita_mi", "Despesa_mi"],
+        markers=True,
+        title="Série histórica — Receita vs Despesa<br><sup>Valores em R$ milhões</sup>",
+    )
+    fig_rd.update_layout(margin=dict(l=10, r=10, t=70, b=10), height=420, separators=".,")
+    fig_rd.update_layout(legend_title_text="")
+    fig_rd.update_yaxes(title="", tickformat=",.0f")
+    fig_rd.update_xaxes(title="")
 
-    apply_year_ticks(fig_rd, ANOS)
-    fig_rd.update_yaxes(title="Valor")
+    # Cores e hover (Ano = ano exibido, sem texto explicando)
+    for tr in fig_rd.data:
+        if tr.name == "Receita_mi":
+            tr.name = "Receita"
+            tr.line.color = BRAND_BLUE
+            tr.marker.color = BRAND_BLUE
+        elif tr.name == "Despesa_mi":
+            tr.name = "Despesa"
+            tr.line.color = BRAND_RED
+            tr.marker.color = BRAND_RED
+        tr.line.width = 3
+        tr.marker.size = 8
+        tr.customdata = dd["_ano_exib"]
+        tr.hovertemplate = "%{fullData.name}<br>Ano: %{customdata}<br>R$ %{y:,.1f}<extra></extra>"
 
-    # FPM grande (série)
-    fig_f_big = series_fig(fpm_long, "FPM", municipio, "Série histórica — FPM")
+    apply_year_ticks(fig_rd, ANOS, axis_title="")
 
-    # ✅ Rankings consolidados no Resumo (ano do Resumo)
+    # FPM grande (série em milhões)
+    fig_f_big = series_fig_money_mi(
+        fpm_long,
+        "FPM",
+        municipio,
+        "Série histórica — FPM<br><sup>Valores em R$ milhões</sup>",
+    )
+    fig_f_big.update_layout(height=420)
+
+    # Rankings
     fig_rank_r = ranking_fig(receita_long, "Receita", ano, municipio, top_n=20)
-    fig_rank_r.update_layout(height=420, title=f"Receita — Ranking (Top 20) • Ano exibido {display_year(ano)}")
+    fig_rank_r.update_layout(height=420, title="Receita")
 
     fig_rank_d = ranking_fig(despesa_long, "Despesa", ano, municipio, top_n=20)
-    fig_rank_d.update_layout(height=420, title=f"Despesa — Ranking (Top 20) • Ano exibido {display_year(ano)}")
+    fig_rank_d.update_layout(height=420, title="Despesa")
 
     fig_rank_f = ranking_fig(fpm_long, "FPM", ano, municipio, top_n=20)
-    fig_rank_f.update_layout(height=420, title=f"FPM — Ranking (Top 20) • Ano exibido {display_year(ano)}")
+    fig_rank_f.update_layout(height=420, title="FPM")
 
-    # ✅ Séries consolidadas
-    fig_sr = series_fig(receita_long, "Receita", municipio, "Receita — Série histórica")
-    fig_sd = series_fig(despesa_long, "Despesa", municipio, "Despesa — Série histórica")
-    fig_sf = series_fig(fpm_long, "FPM", municipio, "FPM — Série histórica")
+    # Séries
+    fig_sr = series_fig_money_mi(receita_long, "Receita", municipio, "Receita — Série histórica<br><sup>Valores em R$ milhões</sup>")
+    fig_sd = series_fig_money_mi(despesa_long, "Despesa", municipio, "Despesa — Série histórica<br><sup>Valores em R$ milhões</sup>")
+    fig_sf = series_fig_money_mi(fpm_long, "FPM", municipio, "FPM — Série histórica<br><sup>Valores em R$ milhões</sup>")
 
     return (
         r_txt, d_txt, f_txt, s_txt,
         fig_rd, fig_f_big,
         fig_rank_r, fig_rank_d, fig_rank_f,
         fig_sr, fig_sd, fig_sf,
-    )
-
-
-@app.callback(
-    Output("fig_receita_ranking", "figure"),
-    Output("fig_receita_series", "figure"),
-    Input("municipio", "value"),
-    Input("ano_receita", "value"),
-)
-def update_receita(municipio: str, ano: int):
-    return (
-        ranking_fig(receita_long, "Receita", ano, municipio),
-        series_fig(receita_long, "Receita", municipio, "Série histórica — Receita"),
-    )
-
-
-@app.callback(
-    Output("fig_despesa_ranking", "figure"),
-    Output("fig_despesa_series", "figure"),
-    Input("municipio", "value"),
-    Input("ano_despesa", "value"),
-)
-def update_despesa(municipio: str, ano: int):
-    return (
-        ranking_fig(despesa_long, "Despesa", ano, municipio),
-        series_fig(despesa_long, "Despesa", municipio, "Série histórica — Despesa"),
-    )
-
-
-@app.callback(
-    Output("fig_fpm_ranking", "figure"),
-    Output("fig_fpm_series_tab", "figure"),
-    Input("municipio", "value"),
-    Input("ano_fpm", "value"),
-)
-def update_fpm(municipio: str, ano: int):
-    return (
-        ranking_fig(fpm_long, "FPM", ano, municipio),
-        series_fig(fpm_long, "FPM", municipio, "Série histórica — FPM"),
     )
 
 
