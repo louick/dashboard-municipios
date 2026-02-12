@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import re
 import numpy as np
 import pandas as pd
 
@@ -22,12 +23,12 @@ XLSX_PATH = Path(os.getenv("XLSX_PATH", str(DEFAULT_XLSX))).expanduser().resolve
 MUNICIPAL_IBGE_MIN = 1500000
 MUNICIPAL_IBGE_MAX = 1600000  # exclusivo
 
-YEAR_OFFSET = 2  # <-- ANO EXIBIDO = ANO REAL + 2
+YEAR_OFFSET = 2  # ANO EXIBIDO = ANO REAL + 2 (sem mostrar isso na UI)
 
 # Financeiro: exibir em milhões (para KPIs e gráficos financeiros)
 MONEY_SCALE = 1_000_000  # 1 milhão
 
-# Branding (inspirado no topo Gov PA / Fapespa)
+# Branding
 BRAND_BLUE = "#0B4D8C"
 BRAND_BLUE_DARK = "#083A69"
 BRAND_RED = "#E31B23"
@@ -44,7 +45,8 @@ def display_year(ano_real: int) -> int:
 
 def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = ""):
     """
-    Elimina frações de ano e mostra ANO EXIBIDO (ano real + YEAR_OFFSET).
+    Elimina frações de ano e mostra ANO EXIBIDO (ano real + YEAR_OFFSET) nos eixos,
+    sem explicitar isso na UI.
     """
     anos_reais = sorted([int(a) for a in anos_reais if a is not None])
     fig.update_xaxes(
@@ -67,7 +69,7 @@ def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = ""):
         template="plotly_white",
         paper_bgcolor=BRAND_CARD,
         plot_bgcolor=BRAND_CARD,
-        separators=".,",  # pt-BR: milhar "." e decimal ","
+        separators=".,",
         font=dict(
             family="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial",
             color=BRAND_TEXT,
@@ -80,19 +82,37 @@ def apply_year_ticks(fig, anos_reais: list[int], axis_title: str = ""):
 # Helpers
 # =========================
 def format_ptbr_number(x: float | int, decimals: int = 2) -> str:
-    # 1234567.89 -> "1.234.567,89"
     s = f"{float(x):,.{decimals}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def format_number_mi(v: float | int | None, decimals: int = 1) -> str:
-    """
-    Formata número já em milhões (sem prefixo "R$" — fica mais limpo pros cards).
-    Ex: 541.7 -> "541,7"
-    """
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "—"
     return format_ptbr_number(float(v), decimals=decimals)
+
+
+def normalize_indicator_label(label: str) -> str:
+    """
+    Ajustes visuais nos nomes dos indicadores (sem mexer no Excel):
+    - Remove 'mil' de 'R$ mil/Hab.' -> 'R$/hab.'
+    """
+    s = str(label or "").strip()
+
+    # Normaliza variações comuns de "mil/hab"
+    # Exemplos:
+    # "PIB Per capita (R$ mil/Hab.) - 2022" -> "PIB Per capita (R$/hab.) - 2022"
+    # ".... (R$ mil/hab.)" -> "(R$/hab.)"
+    s = re.sub(r"R\$\s*mil\s*/\s*Hab\.?", "R$/hab.", s, flags=re.IGNORECASE)
+    s = re.sub(r"\(\s*R\$\s*/\s*hab\.?\s*\)", "(R$/hab.)", s, flags=re.IGNORECASE)
+
+    # Se tiver só "mil/hab" dentro de parênteses, força também:
+    s = re.sub(r"\(\s*mil\s*/\s*hab\.?\s*\)", "(R$/hab.)", s, flags=re.IGNORECASE)
+    s = re.sub(r"mil\s*/\s*hab\.?", "R$/hab.", s, flags=re.IGNORECASE)
+
+    # Pequena limpeza de espaços duplicados
+    s = re.sub(r"\s{2,}", " ", s)
+    return s
 
 
 def format_value(indicador: str, v) -> str:
@@ -107,10 +127,14 @@ def format_value(indicador: str, v) -> str:
 
     if isinstance(v, (int, float)):
         ind_upper = (indicador or "").upper()
+
+        # NBSP para nunca quebrar "R$" do número
         if "R$" in ind_upper:
-            return f"R$ {format_ptbr_number(v)}"
+            return f"R$\u00A0{format_ptbr_number(v)}"
+
         if "PERCENT" in ind_upper or "%" in indicador:
             return f"{format_ptbr_number(v)}%"
+
         if float(v).is_integer():
             return f"{int(v):,}".replace(",", ".")
         return format_ptbr_number(v)
@@ -119,13 +143,6 @@ def format_value(indicador: str, v) -> str:
 
 
 def only_municipios_from_indicador_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Abas com:
-    - linha "Pará"
-    - linhas "RI Xxxxx"
-    - depois municípios.
-    Regra: manter apenas IBGE municipal (15xxxxxx), remover RI/Pará.
-    """
     if "Código IBGE" not in df.columns or "Indicador" not in df.columns:
         return df.copy()
 
@@ -154,28 +171,25 @@ def only_municipios_from_nome_municipio_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def wide_to_kv(df: pd.DataFrame, municipio: str, nome_col: str) -> pd.DataFrame:
-    """
-    Pega 1 linha (município) e transforma em tabela 2-colunas: Indicador / Valor.
-    """
     row = df.loc[df[nome_col] == municipio]
     if row.empty:
         return pd.DataFrame([{"Indicador": "—", "Valor": "Município não encontrado nessa aba"}])
 
     row = row.iloc[0].to_dict()
 
-    # Remover chaves técnicas / metadados (inclui IBGE para não aparecer como “Indicador”)
     for k in list(row.keys()):
         if k in ["Código IBGE", "IBGE", "R. Integ.", "Indicador", "Nome_Município"]:
             row.pop(k, None)
 
-    items = [{"Indicador": str(k), "Valor": format_value(str(k), v)} for k, v in row.items()]
+    items = []
+    for k, v in row.items():
+        k2 = normalize_indicator_label(str(k))
+        items.append({"Indicador": k2, "Valor": format_value(k2, v)})
+
     return pd.DataFrame(items)
 
 
 def melt_years(df: pd.DataFrame, value_name: str) -> pd.DataFrame:
-    """
-    Converte abas tipo Receita/Despesa/FPM (colunas 2019..2023) para formato longo.
-    """
     df = df.copy()
     df = df.loc[:, [c for c in df.columns if not (isinstance(c, str) and c.startswith("Unnamed"))]]
     df = only_municipios_from_nome_municipio_sheet(df)
@@ -251,9 +265,7 @@ def make_kv_table_component(table_id: str, title: str) -> html.Div:
         children=[
             html.Div(
                 className="block-head",
-                children=[
-                    html.Div(title, className="block-title"),
-                ],
+                children=[html.Div(title, className="block-title")],
             ),
             dash_table.DataTable(
                 id=table_id,
@@ -273,6 +285,18 @@ def make_kv_table_component(table_id: str, title: str) -> html.Div:
                     "fontSize": "14px",
                     "border": f"1px solid {BRAND_BORDER}",
                 },
+                # ✅ impede quebrar "R$" e alinha valor
+                style_cell_conditional=[
+                    {"if": {"column_id": "Indicador"}, "textAlign": "left"},
+                    {
+                        "if": {"column_id": "Valor"},
+                        "textAlign": "right",
+                        "whiteSpace": "nowrap",
+                        "minWidth": "140px",
+                        "width": "140px",
+                        "maxWidth": "180px",
+                    },
+                ],
                 style_header={
                     "fontWeight": "800",
                     "backgroundColor": BRAND_BLUE,
@@ -304,7 +328,6 @@ def ranking_fig(df_long: pd.DataFrame, value_col: str, ano: int, municipio: str,
     top["_sel"] = np.where(top["Municipio"] == municipio, "Selecionado", "Outros")
     top = top.sort_values(value_col, ascending=True)
 
-    # valores em milhões
     top["_value_mi"] = pd.to_numeric(top[value_col], errors="coerce") / MONEY_SCALE
 
     fig = px.bar(
@@ -331,6 +354,9 @@ def ranking_fig(df_long: pd.DataFrame, value_col: str, ano: int, municipio: str,
             family="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial",
             color=BRAND_TEXT,
         ),
+        # ✅ garante que qualquer título fique central (quando for setado depois)
+        title_x=0.5,
+        title_xanchor="center",
     )
     fig.update_xaxes(
         showgrid=True,
@@ -344,9 +370,6 @@ def ranking_fig(df_long: pd.DataFrame, value_col: str, ano: int, municipio: str,
 
 
 def series_fig_money_mi(df_long: pd.DataFrame, value_col: str, municipio: str, title: str):
-    """
-    Série (financeiro) em R$ milhões.
-    """
     if municipio is None:
         fig = px.line(title="—")
         fig.update_layout(height=360)
@@ -606,12 +629,13 @@ topbar = html.Div(
                         html.Div(
                             children=[
                                 html.Div("PEV 2025 • Perfis Econômicos Vocacionais", className="title"),
-                                html.Div("Municípios Paraenses • somente municípios (RI removido)", className="subtitle"),
+                                # ✅ removido “somente municípios (RI removido)”
+                                html.Div("Municípios Paraenses", className="subtitle"),
                             ]
                         ),
                     ],
                 ),
-                html.Div(),  # (vazio) — removido texto bobo do ano
+                html.Div(),  # vazio
             ],
         ),
     ],
@@ -637,13 +661,14 @@ sidebar = dbc.Card(
                             searchable=True,
                             placeholder="Selecione um município…",
                         ),
-                        html.Div(id="meta_municipio", style={"marginTop": "10px"}),
+                        # ✅ removido IBGE abaixo do seletor (sem meta_municipio)
                     ],
                 ),
             ]
         )
     ],
 )
+
 
 def year_dropdown(id_, value):
     return dcc.Dropdown(
@@ -653,9 +678,11 @@ def year_dropdown(id_, value):
         clearable=False,
     )
 
+
 def wrap_graph(graph_id: str, height: int | None = None):
     g = dcc.Graph(id=graph_id, style={"height": f"{height}px"} if height else {})
     return dbc.Spinner(html.Div(g), color="primary", delay_show=150)
+
 
 # =========================
 # TABS (AGRUPADO)
@@ -849,17 +876,6 @@ app.layout = dbc.Container(
 # =========================
 # Callbacks
 # =========================
-@app.callback(Output("meta_municipio", "children"), Input("municipio", "value"))
-def update_meta(municipio: str):
-    if not municipio:
-        return "—"
-    row = receita_long[receita_long["Municipio"] == municipio]
-    if row.empty:
-        return "—"
-    ibge = int(row.iloc[0]["IBGE"])
-    return html.Div(className="pill", children=[html.I(className="bi bi-hash"), html.Span(f"IBGE: {ibge}")])
-
-
 @app.callback(
     Output("card_receita", "children"),
     Output("card_despesa", "children"),
@@ -893,7 +909,6 @@ def update_contas_publicas(municipio: str, ano: int):
     saldo_mi = None if saldo is None else (saldo / MONEY_SCALE)
     s_txt = format_number_mi(saldo_mi, decimals=1)
 
-    # Série Receita vs Despesa (em milhões)
     dd = pd.merge(
         receita_long[receita_long["Municipio"] == municipio][["Ano", "Receita"]],
         despesa_long[despesa_long["Municipio"] == municipio][["Ano", "Despesa"]],
@@ -917,7 +932,6 @@ def update_contas_publicas(municipio: str, ano: int):
     fig_rd.update_yaxes(title="", tickformat=",.0f")
     fig_rd.update_xaxes(title="")
 
-    # Cores e hover (Ano = ano exibido, sem texto explicando)
     for tr in fig_rd.data:
         if tr.name == "Receita_mi":
             tr.name = "Receita"
@@ -934,7 +948,6 @@ def update_contas_publicas(municipio: str, ano: int):
 
     apply_year_ticks(fig_rd, ANOS, axis_title="")
 
-    # FPM grande (série em milhões)
     fig_f_big = series_fig_money_mi(
         fpm_long,
         "FPM",
@@ -943,20 +956,42 @@ def update_contas_publicas(municipio: str, ano: int):
     )
     fig_f_big.update_layout(height=420)
 
-    # Rankings
     fig_rank_r = ranking_fig(receita_long, "Receita", ano, municipio, top_n=20)
-    fig_rank_r.update_layout(height=420, title="Receita")
+    fig_rank_r.update_layout(
+        height=420,
+        title=dict(text="Receita", x=0.5, xanchor="center"),
+    )
 
     fig_rank_d = ranking_fig(despesa_long, "Despesa", ano, municipio, top_n=20)
-    fig_rank_d.update_layout(height=420, title="Despesa")
+    fig_rank_d.update_layout(
+        height=420,
+        title=dict(text="Despesa", x=0.5, xanchor="center"),
+    )
 
     fig_rank_f = ranking_fig(fpm_long, "FPM", ano, municipio, top_n=20)
-    fig_rank_f.update_layout(height=420, title="FPM")
+    fig_rank_f.update_layout(
+        height=420,
+        title=dict(text="FPM", x=0.5, xanchor="center"),
+    )
 
-    # Séries
-    fig_sr = series_fig_money_mi(receita_long, "Receita", municipio, "Receita — Série histórica<br><sup>Valores em R$ milhões</sup>")
-    fig_sd = series_fig_money_mi(despesa_long, "Despesa", municipio, "Despesa — Série histórica<br><sup>Valores em R$ milhões</sup>")
-    fig_sf = series_fig_money_mi(fpm_long, "FPM", municipio, "FPM — Série histórica<br><sup>Valores em R$ milhões</sup>")
+    fig_sr = series_fig_money_mi(
+        receita_long,
+        "Receita",
+        municipio,
+        "Receita — Série histórica<br><sup>Valores em R$ milhões</sup>",
+    )
+    fig_sd = series_fig_money_mi(
+        despesa_long,
+        "Despesa",
+        municipio,
+        "Despesa — Série histórica<br><sup>Valores em R$ milhões</sup>",
+    )
+    fig_sf = series_fig_money_mi(
+        fpm_long,
+        "FPM",
+        municipio,
+        "FPM — Série histórica<br><sup>Valores em R$ milhões</sup>",
+    )
 
     return (
         r_txt, d_txt, f_txt, s_txt,
@@ -976,21 +1011,26 @@ def _update_kv_table(sheet_label: str, municipio: str):
 def update_table_geral(municipio: str):
     return _update_kv_table("Geral", municipio)
 
+
 @app.callback(Output("table_eco1", "data"), Input("municipio", "value"))
 def update_table_eco1(municipio: str):
     return _update_kv_table("Economia 01", municipio)
+
 
 @app.callback(Output("table_eco2", "data"), Input("municipio", "value"))
 def update_table_eco2(municipio: str):
     return _update_kv_table("Economia 02", municipio)
 
+
 @app.callback(Output("table_inf1", "data"), Input("municipio", "value"))
 def update_table_inf1(municipio: str):
     return _update_kv_table("Infraest. 01", municipio)
 
+
 @app.callback(Output("table_tur1", "data"), Input("municipio", "value"))
 def update_table_tur1(municipio: str):
     return _update_kv_table("Turismo - Empreendimentos", municipio)
+
 
 @app.callback(Output("table_tur2", "data"), Input("municipio", "value"))
 def update_table_tur2(municipio: str):
